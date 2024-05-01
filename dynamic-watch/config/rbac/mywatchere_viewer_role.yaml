@@ -1,0 +1,23 @@
+# permissions for end users to view mywatcheres.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: dynamic-watch
+    app.kubernetes.io/managed-by: kustomize
+  name: mywatchere-viewer-role
+rules:
+- apiGroups:
+  - core.mydomain.com
+  resources:
+  - mywatcheres
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - core.mydomain.com
+  resources:
+  - mywatcheres/status
+  verbs:
+  - get

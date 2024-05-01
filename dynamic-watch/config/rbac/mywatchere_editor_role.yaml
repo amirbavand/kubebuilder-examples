@@ -1,0 +1,27 @@
+# permissions for end users to edit mywatcheres.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: dynamic-watch
+    app.kubernetes.io/managed-by: kustomize
+  name: mywatchere-editor-role
+rules:
+- apiGroups:
+  - core.mydomain.com
+  resources:
+  - mywatcheres
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - core.mydomain.com
+  resources:
+  - mywatcheres/status
+  verbs:
+  - get

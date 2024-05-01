@@ -7,4 +7,19 @@ layout:
 - go.kubebuilder.io/v4
 projectName: dynamic-watch
 repo: github.com/amirbavand/dynamic-watch
+resources:
+- controller: true
+  group: core
+  kind: MyWatcher
+  path: k8s.io/api/core/v1
+  version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: mydomain.com
+  group: core
+  kind: MyWatchere
+  path: github.com/amirbavand/dynamic-watch/api/v1
+  version: v1
 version: "3"

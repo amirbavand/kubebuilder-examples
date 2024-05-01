@@ -1,0 +1,9 @@
+apiVersion: core.mydomain.com/v1
+kind: MyWatchere
+metadata:
+  labels:
+    app.kubernetes.io/name: dynamic-watch
+    app.kubernetes.io/managed-by: kustomize
+  name: mywatchere-sample
+spec:
+  # TODO(user): Add fields here
