@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	ct "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -20,9 +21,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
+// ControllerEntry represents a dynamically managed controller.
+type ControllerEntry struct {
+	controller controller.Controller
+	cancelFunc context.CancelFunc
+}
+
 // WatchManager manages dynamic watches
 type WatchManager struct {
-	watchedResources map[schema.GroupVersionKind]struct{}
+	watchedResources map[schema.GroupVersionKind]ct.Controller
 	mu               sync.Mutex
 	cache            cache.Cache
 	controller       controller.Controller
@@ -31,7 +38,7 @@ type WatchManager struct {
 
 func NewWatchManager(controller controller.Controller, cache cache.Cache, mgr manager.Manager) *WatchManager {
 	return &WatchManager{
-		watchedResources: make(map[schema.GroupVersionKind]struct{}),
+		watchedResources: make(map[schema.GroupVersionKind]ct.Controller),
 		controller:       controller,
 		cache:            cache,
 		mgr:              mgr,
@@ -40,7 +47,7 @@ func NewWatchManager(controller controller.Controller, cache cache.Cache, mgr ma
 
 func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	wm.mu.Lock()
-	defer wm.mu.Unlock()
+	defer wm.mu.Lock()
 
 	if _, exists := wm.watchedResources[gvk]; exists {
 		return nil
@@ -49,7 +56,6 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvk)
 
-	// Correctly use source.Kind as a function
 	kindSource := source.Kind(wm.cache, obj)
 	err := wm.controller.Watch(kindSource, &handler.EnqueueRequestForObject{})
 	if err != nil {
@@ -61,24 +67,26 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 		Scheme: wm.mgr.GetScheme(),
 		GVK:    gvk,
 	}
-	err = ctrl.NewControllerManagedBy(wm.mgr).
+	c, err := ctrl.NewControllerManagedBy(wm.mgr).
 		For(obj).
 		WithEventFilter(eventPredicates).
-		Complete(dynamicReconciler)
+		Build(dynamicReconciler)
 	if err != nil {
 		return err
 	}
 
-	wm.watchedResources[gvk] = struct{}{}
+	wm.watchedResources[gvk] = c
 	return nil
 }
 
 func (wm *WatchManager) RemoveWatch(gvk schema.GroupVersionKind) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
+	if c, exists := wm.watchedResources[gvk]; exists {
+		c.Stop()
+		delete(wm.watchedResources, gvk)
+	}
 
-	delete(wm.watchedResources, gvk)
-	// Implement logic to actually remove the watch from the controller if needed
 }
 
 // DynamicReconciler reconciles dynamic resources
@@ -88,29 +96,6 @@ type DynamicReconciler struct {
 	GVK    schema.GroupVersionKind
 }
 
-// func (r *DynamicReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-// 	log := log.FromContext(ctx)
-
-// 	// Fetch the resource
-// 	resource := &unstructured.Unstructured{}
-// 	resource.SetGroupVersionKind(r.GVK)
-// 	err := r.Get(ctx, req.NamespacedName, resource)
-// 	if err != nil {
-// 		if client.IgnoreNotFound(err) != nil {
-// 			// Error reading the object - requeue the request.
-// 			return reconcile.Result{}, err
-// 		}
-// 		// Resource not found, must have been deleted
-// 		log.Info("Resource deleted", "GVK", r.GVK, "name", req.Name, "namespace", req.Namespace)
-// 		// Add your deletion handling logic here if needed
-// 		return reconcile.Result{}, nil
-// 	}
-
-// 	// Log the event
-// 	log.Info("Reconciled dynamic resource", "GVK", r.GVK, "resource", resource)
-
-//		return reconcile.Result{}, nil
-//	}
 func (r *DynamicReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := log.FromContext(ctx)
 
