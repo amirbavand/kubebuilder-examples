@@ -72,6 +72,8 @@ func (r *MyWatchereReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciling resource", "resource", req.NamespacedName)
 	r.createConfigMap(ctx, req.NamespacedName, "created")
+	//add more resource types to watch here and create configmaps
+
 	return reconcile.Result{}, nil
 
 }

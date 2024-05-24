@@ -1,0 +1,27 @@
+# permissions for end users to edit resourcetemplates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: dynamic-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: resourcetemplate-editor-role
+rules:
+- apiGroups:
+  - core.example.com
+  resources:
+  - resourcetemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - core.example.com
+  resources:
+  - resourcetemplates/status
+  verbs:
+  - get
