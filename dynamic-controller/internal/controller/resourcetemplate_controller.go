@@ -1,19 +1,3 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -32,6 +16,47 @@ import (
 	corev1 "github.com/amirbavand/dynamic-controller/api/v1"
 )
 
+const resourceTemplateFinalizer = "core.example.com/finalizer"
+
+// containsString checks if a string is in a slice
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// removeString removes a string from a slice
+func removeString(slice []string, s string) []string {
+	var result []string
+	for _, item := range slice {
+		if item != s {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// EnsureFinalizer adds a finalizer to the resource if not present
+func (r *ResourceTemplateReconciler) EnsureFinalizer(resourceTemplate *corev1.ResourceTemplate) bool {
+	if !containsString(resourceTemplate.GetFinalizers(), resourceTemplateFinalizer) {
+		resourceTemplate.SetFinalizers(append(resourceTemplate.GetFinalizers(), resourceTemplateFinalizer))
+		return true
+	}
+	return false
+}
+
+// RemoveFinalizer removes the finalizer from the resource
+func (r *ResourceTemplateReconciler) RemoveFinalizer(resourceTemplate *corev1.ResourceTemplate) bool {
+	if containsString(resourceTemplate.GetFinalizers(), resourceTemplateFinalizer) {
+		resourceTemplate.SetFinalizers(removeString(resourceTemplate.GetFinalizers(), resourceTemplateFinalizer))
+		return true
+	}
+	return false
+}
+
 // ResourceTemplateReconciler reconciles a ResourceTemplate object
 type ResourceTemplateReconciler struct {
 	client.Client
@@ -46,27 +71,41 @@ type ResourceTemplateReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ResourceTemplate object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.17.3/pkg/reconcile
 func (r *ResourceTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	log := log.FromContext(ctx)
+	log.Info("Reconciling ResourceTemplate", "name", req.NamespacedName)
 
-	// TODO(user): your logic here
 	resourceTemplate := &corev1.ResourceTemplate{}
 	err := r.Get(ctx, req.NamespacedName, resourceTemplate)
 	if err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// Handle deletion
+
+	// Check if the resource is being deleted
 	if !resourceTemplate.DeletionTimestamp.IsZero() {
+		// The resource is being deleted
+		log.Info("ResourceTemplate deleted", "name", resourceTemplate.Name)
 		r.cleanupWatches(resourceTemplate)
-		return reconcile.Result{}, nil
+
+		// Remove finalizer
+		if r.RemoveFinalizer(resourceTemplate) {
+			err := r.Update(ctx, resourceTemplate)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		return ctrl.Result{}, nil
 	}
+
+	// Ensure finalizer is added to the resource
+	if r.EnsureFinalizer(resourceTemplate) {
+		err := r.Update(ctx, resourceTemplate)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Add watches for the resources specified in the spec
 	for _, res := range resourceTemplate.Spec.Resources {
 		gvk := schema.GroupVersionKind{
@@ -77,7 +116,7 @@ func (r *ResourceTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 		err := r.WatchManager.AddWatch(gvk)
 		if err != nil {
-			log.Log.Error(err, "unable to watch for resource", "gvk", gvk)
+			log.Error(err, "unable to watch for resource", "gvk", gvk)
 		}
 	}
 
@@ -111,7 +150,7 @@ func (r *ResourceTemplateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	// Initialize the WatchManager with the controller and the manager's cache
-	r.WatchManager = NewWatchManager(c, mgr.GetCache(), mgr)
+	r.WatchManager = NewWatchManager(mgr)
 
 	return nil
 }
