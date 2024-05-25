@@ -28,36 +28,138 @@ type ControllerEntry struct {
 
 // WatchManager manages dynamic watches.
 type WatchManager struct {
-	refCounts        map[schema.GroupVersionKind]int
-	watchedResources map[schema.GroupVersionKind]ControllerEntry
-	mu               sync.Mutex
-	cache            cache.Cache
-	client           client.Client
-	scheme           *runtime.Scheme
-	mgr              manager.Manager
+	refCounts         map[schema.GroupVersionKind]int
+	watchedResources  map[schema.GroupVersionKind]ControllerEntry
+	resourceTemplates map[string]map[schema.GroupVersionKind]struct{}
+	mu                sync.Mutex
+	cache             cache.Cache
+	client            client.Client
+	scheme            *runtime.Scheme
+	mgr               manager.Manager
 }
 
 func NewWatchManager(mgr manager.Manager) *WatchManager {
 	return &WatchManager{
-		watchedResources: make(map[schema.GroupVersionKind]ControllerEntry),
-		refCounts:        make(map[schema.GroupVersionKind]int),
-		cache:            mgr.GetCache(),
-		client:           mgr.GetClient(),
-		scheme:           mgr.GetScheme(),
-		mgr:              mgr,
+		watchedResources:  make(map[schema.GroupVersionKind]ControllerEntry),
+		refCounts:         make(map[schema.GroupVersionKind]int),
+		resourceTemplates: make(map[string]map[schema.GroupVersionKind]struct{}),
+		cache:             mgr.GetCache(),
+		client:            mgr.GetClient(),
+		scheme:            mgr.GetScheme(),
+		mgr:               mgr,
 	}
 }
 
-func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
+func (wm *WatchManager) AddWatch(resourceTemplateName string, gvks []schema.GroupVersionKind) error {
+	if _, exists := wm.resourceTemplates[resourceTemplateName]; !exists {
+		wm.resourceTemplates[resourceTemplateName] = make(map[schema.GroupVersionKind]struct{})
+	}
+
+	for _, gvk := range gvks {
+		if _, exists := wm.resourceTemplates[resourceTemplateName][gvk]; exists {
+			continue
+		}
+		wm.resourceTemplates[resourceTemplateName][gvk] = struct{}{}
+		if wm.refCounts[gvk] == 0 {
+			if err := wm.startWatching(gvk); err != nil {
+				return err
+			}
+		}
+		wm.refCounts[gvk]++
+		log.Log.Info("Incremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
+	}
+
+	return nil
+}
+
+func (wm *WatchManager) UpdateWatch(resourceTemplateName string, newGVKs []schema.GroupVersionKind) error {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	if count, exists := wm.refCounts[gvk]; exists {
-		wm.refCounts[gvk] = count + 1
-		log.Log.Info("Incremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
-		return nil
+	if _, exists := wm.resourceTemplates[resourceTemplateName]; !exists {
+		log.Log.Info("Resource template not found", "resourceTemplateName", resourceTemplateName)
+		return wm.AddWatch(resourceTemplateName, newGVKs)
 	}
 
+	oldGVKs := wm.resourceTemplates[resourceTemplateName]
+	removedGVKs := make(map[schema.GroupVersionKind]struct{})
+	addedGVKs := make(map[schema.GroupVersionKind]struct{})
+
+	// Determine removed GVKs
+	for gvk := range oldGVKs {
+		removedGVKs[gvk] = struct{}{}
+	}
+	for _, gvk := range newGVKs {
+		if _, exists := removedGVKs[gvk]; exists {
+			delete(removedGVKs, gvk)
+		} else {
+			addedGVKs[gvk] = struct{}{}
+		}
+	}
+
+	// Remove watches for removed GVKs
+	for gvk := range removedGVKs {
+		wm.removeWatchForGVK(resourceTemplateName, gvk)
+	}
+
+	// Add new watches
+	for gvk := range addedGVKs {
+		if err := wm.addWatchForGVK(resourceTemplateName, gvk); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (wm *WatchManager) RemoveWatch(resourceTemplateName string) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	log.Log.Info("Removing watch", "resourceTemplateName", resourceTemplateName)
+
+	if watchedGVKs, exists := wm.resourceTemplates[resourceTemplateName]; exists {
+		for gvk := range watchedGVKs {
+			wm.refCounts[gvk]--
+			if wm.refCounts[gvk] <= 0 {
+				wm.stopWatching(gvk)
+				delete(wm.refCounts, gvk)
+			}
+		}
+		delete(wm.resourceTemplates, resourceTemplateName)
+	}
+	//log reference counts
+	for gvk, count := range wm.refCounts {
+		log.Log.Info("Reference count", "gvk", gvk, "count", count)
+	}
+
+	wm.logActiveControllers()
+}
+
+func (wm *WatchManager) addWatchForGVK(resourceTemplateName string, gvk schema.GroupVersionKind) error {
+	wm.resourceTemplates[resourceTemplateName][gvk] = struct{}{}
+	if wm.refCounts[gvk] == 0 {
+		if err := wm.startWatching(gvk); err != nil {
+			log.Log.Error(err, "unable to start watching", "gvk", gvk)
+			return err
+		}
+	}
+	wm.refCounts[gvk]++
+	log.Log.Info("Incremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
+	return nil
+}
+
+func (wm *WatchManager) removeWatchForGVK(resourceTemplateName string, gvk schema.GroupVersionKind) {
+	wm.refCounts[gvk]--
+	if wm.refCounts[gvk] <= 0 {
+		wm.stopWatching(gvk)
+		delete(wm.refCounts, gvk)
+	}
+	delete(wm.resourceTemplates[resourceTemplateName], gvk)
+	log.Log.Info("Decremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
+}
+
+func (wm *WatchManager) startWatching(gvk schema.GroupVersionKind) error {
+	log.Log.Info("Starting watch", "gvk", gvk)
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvk)
 
@@ -71,7 +173,6 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	c, err := controller.NewUnmanaged("dynamic-controller-"+gvk.Kind, wm.mgr, controller.Options{
 		Reconciler: dynamicReconciler,
 	})
-
 	if err != nil {
 		cancelFunc()
 		return err
@@ -86,9 +187,6 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	}
 
 	wm.watchedResources[gvk] = ControllerEntry{controller: c, cancelFunc: cancelFunc, ctx: ctx}
-	wm.refCounts[gvk] = 1
-	log.Log.Info("Watch added", "gvk", gvk, "count", wm.refCounts[gvk])
-
 	go func() {
 		if err := c.Start(ctx); err != nil && err != context.Canceled {
 			log.Log.Error(err, "unable to start controller", "gvk", gvk)
@@ -97,34 +195,13 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	return nil
 }
 
-func (wm *WatchManager) RemoveWatch(gvk schema.GroupVersionKind) {
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-	log.Log.Info("Removing watch", "gvk", gvk)
-
-	if count, exists := wm.refCounts[gvk]; exists {
-		if count > 1 {
-			wm.refCounts[gvk] = count - 1
-			log.Log.Info("Decremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
-			return
-		}
-
-		if entry, exists := wm.watchedResources[gvk]; exists {
-			entry.cancelFunc() // Cancel the context to stop the controller
-			log.Log.Info("Waiting for controller to stop", "gvk", gvk)
-			<-entry.ctx.Done() // Wait until the context is fully canceled
-			delete(wm.watchedResources, gvk)
-			log.Log.Info("Watch removed", "gvk", gvk)
-		}
-
-		delete(wm.refCounts, gvk)
-		log.Log.Info("Removed watch reference count", "gvk", gvk)
-	} else {
-		log.Log.Info("No watch found for", "gvk", gvk)
+func (wm *WatchManager) stopWatching(gvk schema.GroupVersionKind) {
+	log.Log.Info("Stopping watch", "gvk", gvk)
+	if entry, exists := wm.watchedResources[gvk]; exists {
+		entry.cancelFunc() // Cancel the context to stop the controller
+		<-entry.ctx.Done() // Wait until the context is fully canceled
+		delete(wm.watchedResources, gvk)
 	}
-
-	// Log active controllers
-	wm.logActiveControllers()
 }
 
 // logActiveControllers logs all active controllers.

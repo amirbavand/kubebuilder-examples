@@ -1,0 +1,11 @@
+apiVersion: core.example.com/v1
+kind: ResourceTemplate
+metadata:
+  name: second-example-resourcetemplate
+  namespace: default
+spec:
+  resources:
+    # - group: apps
+    #   version: v1
+    #   kind: Deployment
+    #   name: example-deployment

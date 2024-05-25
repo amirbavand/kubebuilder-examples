@@ -85,7 +85,7 @@ func (r *ResourceTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if !resourceTemplate.DeletionTimestamp.IsZero() {
 		// The resource is being deleted
 		log.Info("ResourceTemplate deleted", "name", resourceTemplate.Name)
-		r.cleanupWatches(resourceTemplate)
+		r.WatchManager.RemoveWatch(resourceTemplate.Name)
 
 		// Remove finalizer
 		if r.RemoveFinalizer(resourceTemplate) {
@@ -106,33 +106,24 @@ func (r *ResourceTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
-	// Add watches for the resources specified in the spec
+	// Convert resources to GVKs
+	var gvkList []schema.GroupVersionKind
 	for _, res := range resourceTemplate.Spec.Resources {
 		gvk := schema.GroupVersionKind{
 			Group:   res.Group,
 			Version: res.Version,
 			Kind:    res.Kind,
 		}
+		gvkList = append(gvkList, gvk)
+	}
 
-		err := r.WatchManager.AddWatch(gvk)
-		if err != nil {
-			log.Error(err, "unable to watch for resource", "gvk", gvk)
-		}
+	// Update watches for the resources specified in the spec
+	err = r.WatchManager.UpdateWatch(resourceTemplate.Name, gvkList)
+	if err != nil {
+		log.Error(err, "unable to update watch for resource", "resourceTemplate", resourceTemplate.Name)
 	}
 
 	return ctrl.Result{}, nil
-}
-
-// cleanupWatches removes watches for resources specified in the ResourceTemplate spec
-func (r *ResourceTemplateReconciler) cleanupWatches(resourceTemplate *corev1.ResourceTemplate) {
-	for _, res := range resourceTemplate.Spec.Resources {
-		gvk := schema.GroupVersionKind{
-			Group:   res.Group,
-			Version: res.Version,
-			Kind:    res.Kind,
-		}
-		r.WatchManager.RemoveWatch(gvk)
-	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
