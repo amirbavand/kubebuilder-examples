@@ -28,6 +28,7 @@ type ControllerEntry struct {
 
 // WatchManager manages dynamic watches.
 type WatchManager struct {
+	refCounts        map[schema.GroupVersionKind]int
 	watchedResources map[schema.GroupVersionKind]ControllerEntry
 	mu               sync.Mutex
 	cache            cache.Cache
@@ -39,6 +40,7 @@ type WatchManager struct {
 func NewWatchManager(mgr manager.Manager) *WatchManager {
 	return &WatchManager{
 		watchedResources: make(map[schema.GroupVersionKind]ControllerEntry),
+		refCounts:        make(map[schema.GroupVersionKind]int),
 		cache:            mgr.GetCache(),
 		client:           mgr.GetClient(),
 		scheme:           mgr.GetScheme(),
@@ -50,11 +52,12 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	if _, exists := wm.watchedResources[gvk]; exists {
-		log.Log.Info("Watch already exists", "gvk", gvk)
+	if count, exists := wm.refCounts[gvk]; exists {
+		wm.refCounts[gvk] = count + 1
+		log.Log.Info("Incremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
 		return nil
 	}
-	log.Log.Info("I am", "gvk", gvk)
+
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvk)
 
@@ -75,6 +78,7 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	}
 
 	kindSource := source.Kind(wm.cache, obj)
+	eventPredicates := wm.getEventPredicates(ctx)
 	err = c.Watch(kindSource, &handler.EnqueueRequestForObject{}, eventPredicates)
 	if err != nil {
 		cancelFunc()
@@ -82,10 +86,8 @@ func (wm *WatchManager) AddWatch(gvk schema.GroupVersionKind) error {
 	}
 
 	wm.watchedResources[gvk] = ControllerEntry{controller: c, cancelFunc: cancelFunc, ctx: ctx}
-	log.Log.Info("Watch added", "gvk", gvk)
-
-	// Log active controllers
-	wm.logActiveControllers()
+	wm.refCounts[gvk] = 1
+	log.Log.Info("Watch added", "gvk", gvk, "count", wm.refCounts[gvk])
 
 	go func() {
 		if err := c.Start(ctx); err != nil && err != context.Canceled {
@@ -100,12 +102,23 @@ func (wm *WatchManager) RemoveWatch(gvk schema.GroupVersionKind) {
 	defer wm.mu.Unlock()
 	log.Log.Info("Removing watch", "gvk", gvk)
 
-	if entry, exists := wm.watchedResources[gvk]; exists {
-		entry.cancelFunc() // Cancel the context to stop the controller
-		log.Log.Info("Waiting for controller to stop", "gvk", gvk)
-		<-entry.ctx.Done() // Wait until the context is fully canceled
-		delete(wm.watchedResources, gvk)
-		log.Log.Info("Watch removed", "gvk", gvk)
+	if count, exists := wm.refCounts[gvk]; exists {
+		if count > 1 {
+			wm.refCounts[gvk] = count - 1
+			log.Log.Info("Decremented watch reference count", "gvk", gvk, "count", wm.refCounts[gvk])
+			return
+		}
+
+		if entry, exists := wm.watchedResources[gvk]; exists {
+			entry.cancelFunc() // Cancel the context to stop the controller
+			log.Log.Info("Waiting for controller to stop", "gvk", gvk)
+			<-entry.ctx.Done() // Wait until the context is fully canceled
+			delete(wm.watchedResources, gvk)
+			log.Log.Info("Watch removed", "gvk", gvk)
+		}
+
+		delete(wm.refCounts, gvk)
+		log.Log.Info("Removed watch reference count", "gvk", gvk)
 	} else {
 		log.Log.Info("No watch found for", "gvk", gvk)
 	}
@@ -130,7 +143,7 @@ type DynamicReconciler struct {
 
 func (r *DynamicReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := log.FromContext(ctx)
-	log.Info("Reconciling dynamic resourceeeee", "GVK", r.GVK, "name", req.Name, "namespace", req.Namespace)
+	log.Info("Reconciling dynamic resource", "GVK", r.GVK, "name", req.Name, "namespace", req.Namespace)
 
 	resource := &unstructured.Unstructured{}
 	resource.SetGroupVersionKind(r.GVK)
@@ -147,20 +160,44 @@ func (r *DynamicReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	return reconcile.Result{}, nil
 }
 
-var eventPredicates = predicate.Funcs{
-	CreateFunc: func(e event.CreateEvent) bool {
-		log.Log.Info("Resource created", "name", e.Object.GetName(), "kind", e.Object.GetObjectKind().GroupVersionKind().Kind)
-		return true
-	},
-	DeleteFunc: func(e event.DeleteEvent) bool {
-		log.Log.Info("Resource deleted", "name", e.Object.GetName(), "kind", e.Object.GetObjectKind().GroupVersionKind().Kind)
-		return true
-	},
-	UpdateFunc: func(e event.UpdateEvent) bool {
-		log.Log.Info("Resource updated", "name", e.ObjectNew.GetName(), "kind", e.ObjectNew.GetObjectKind().GroupVersionKind().Kind, "old version", e.ObjectOld, "new version", e.ObjectNew)
-		return true
-	},
-	GenericFunc: func(e event.GenericEvent) bool {
-		return true
-	},
+// getEventPredicates returns the event predicates with context check.
+func (wm *WatchManager) getEventPredicates(ctx context.Context) predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+				log.Log.Info("Resource created", "name", e.Object.GetName(), "kind", e.Object.GetObjectKind().GroupVersionKind().Kind)
+				return true
+			}
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+				log.Log.Info("Resource deleted", "name", e.Object.GetName(), "kind", e.Object.GetObjectKind().GroupVersionKind().Kind)
+				return true
+			}
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			select {
+			case <-ctx.Done():
+				log.Log.Info("Context done")
+				return false
+			default:
+				log.Log.Info("Resource updated", "name", e.ObjectNew.GetName(), "kind", e.ObjectNew.GetObjectKind().GroupVersionKind().Kind, "old version", e.ObjectOld, "new version", e.ObjectNew)
+				return true
+			}
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+				return true
+			}
+		},
+	}
 }
